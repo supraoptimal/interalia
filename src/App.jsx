@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { SEED_CARDS } from "./cards.js";
 
 // ─── SM-2 Algorithm ─────────────────────────────────────────────────
@@ -14,32 +14,63 @@ function sm2(card, quality) {
   return { ...card, easeFactor, interval, repetitions, nextReview: Date.now() + interval * 86400000, lastReview: Date.now() };
 }
 
-// ─── Storage (localStorage) ─────────────────────────────────────────
+// ─── Storage ────────────────────────────────────────────────────────
 function save(key, data) { try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { console.error("Save:", e); } }
 function load(key, fb) { try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : fb; } catch { return fb; } }
 
-// ─── Fixed modules ──────────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────────
 const MODULES = ["Public Law", "Criminal Law", "Contract Law", "Tort", "Commercial Law", "Property Law", "Jurisprudence", "Equity & Trusts", "Evidence"];
-
 const CARD_TYPES = { principle: "Principle", case: "Case", application: "Application", distinction: "Distinction" };
 const TYPE_COLORS = { principle: "#D4A574", case: "#7BA5C4", application: "#8BB874", distinction: "#C49BBD" };
-const Q_LABELS = [{ q: 0, l: "Blackout" }, { q: 1, l: "Wrong" }, { q: 2, l: "Struggle" }, { q: 3, l: "OK" }, { q: 4, l: "Good" }, { q: 5, l: "Perfect" }];
+const MAX_OPT_LEN = 180;
 
+// ─── Helpers ────────────────────────────────────────────────────────
 function getDue(cards) { return cards.filter(c => c.nextReview <= Date.now()).sort((a, b) => a.nextReview - b.nextReview); }
 function shuffle(arr) { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function truncate(s, n = MAX_OPT_LEN) { if (!s) return ""; return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s; }
+function isSeedId(id) { return SEED_CARDS.some(c => c.id === id); }
+function isUserCard(card) { return !isSeedId(card.id); }
+
+// Build distractors: 3 from same type (+ same module preferred), fall back to same-type any-module.
+function buildMcqOptions(card, allCards) {
+  const sameTypeModule = allCards.filter(c => c.id !== card.id && c.type === card.type && c.module === card.module && c.back);
+  const sameType = allCards.filter(c => c.id !== card.id && c.type === card.type && c.back);
+  let pool = sameTypeModule.length >= 3 ? sameTypeModule : sameType;
+  const pickedBacks = new Set([card.back]);
+  const distractors = [];
+  for (const c of shuffle(pool)) {
+    if (distractors.length >= 3) break;
+    if (pickedBacks.has(c.back)) continue;
+    pickedBacks.add(c.back);
+    distractors.push(c);
+  }
+  // If still under 3 (tiny pools), widen to any card of any type.
+  if (distractors.length < 3) {
+    for (const c of shuffle(allCards.filter(c => c.id !== card.id && c.back && !pickedBacks.has(c.back)))) {
+      if (distractors.length >= 3) break;
+      pickedBacks.add(c.back);
+      distractors.push(c);
+    }
+  }
+  const correct = { text: truncate(card.back), correct: true };
+  const opts = distractors.map(c => ({ text: truncate(c.back), correct: false }));
+  return shuffle([correct, ...opts]);
+}
 
 // ─── App ────────────────────────────────────────────────────────────
 export default function InterAlia() {
   const [cards, setCards] = useState(SEED_CARDS);
   const [view, setView] = useState("loading");
   const [reviewQueue, setReviewQueue] = useState([]);
+  const [queueMeta, setQueueMeta] = useState({ label: "", mode: "due" }); // due | new
   const [currentIdx, setCurrentIdx] = useState(0);
-  const [flipped, setFlipped] = useState(false);
-  const [showDetails, setShowDetails] = useState(false);
+  const [mcqOptions, setMcqOptions] = useState([]);
+  const [selectedOpt, setSelectedOpt] = useState(null); // index or null
+  const [expandedRelated, setExpandedRelated] = useState({}); // { cardId: true }
   const [moduleFilter, setModuleFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
-  const [ccFilter, setCcFilter] = useState("all"); // all | cross | single
-  const [sessionStats, setSessionStats] = useState({ reviewed: 0, avgQ: 0, qs: [] });
+  const [ccFilter, setCcFilter] = useState("all");
+  const [sessionStats, setSessionStats] = useState({ reviewed: 0, correct: 0, results: [] });
   const [addForm, setAddForm] = useState({ type: "principle", module: MODULES[0], tags: "", front: "", back: "", details: "", crossCutting: false });
   const [searchTerm, setSearchTerm] = useState("");
   const [history, setHistory] = useState([]);
@@ -47,16 +78,36 @@ export default function InterAlia() {
   const [browseOpen, setBrowseOpen] = useState(null);
   const [selectedModule, setSelectedModule] = useState(null);
   const [selectedTypes, setSelectedTypes] = useState({ principle: true, case: true, application: true, distinction: true });
+  const [importMsg, setImportMsg] = useState("");
+  const fileInputRef = useRef(null);
 
   const stats = useMemo(() => {
     const now = Date.now();
-    return { due: cards.filter(c => c.nextReview <= now).length, learning: cards.filter(c => c.repetitions > 0 && c.repetitions < 3).length, mature: cards.filter(c => c.repetitions >= 3).length, new: cards.filter(c => c.repetitions === 0).length, total: cards.length, crossCutting: cards.filter(c => c.crossCutting).length };
+    return { due: cards.filter(c => c.nextReview <= now && c.repetitions > 0).length + cards.filter(c => c.nextReview <= now && c.repetitions === 0 && c.lastReview > 0).length, dueIncludingNew: cards.filter(c => c.nextReview <= now).length, learning: cards.filter(c => c.repetitions > 0 && c.repetitions < 3).length, mature: cards.filter(c => c.repetitions >= 3).length, new: cards.filter(c => c.repetitions === 0 && c.lastReview === 0).length, total: cards.length, crossCutting: cards.filter(c => c.crossCutting).length };
   }, [cards]);
+
+  // Strict "due": cards seen before whose nextReview has passed.
+  const strictDue = useMemo(() => cards.filter(c => c.lastReview > 0 && c.nextReview <= Date.now()), [cards]);
+
+  // Card lookup for related-link resolution.
+  const cardById = useMemo(() => { const m = {}; for (const c of cards) m[c.id] = c; return m; }, [cards]);
 
   // Load
   useEffect(() => {
     const d = load("interalia-all", null);
-    if (d?.cards?.length) setCards(d.cards);
+    let nextCards = SEED_CARDS.map(c => ({ ...c, related: c.related || [] }));
+    if (d?.cards?.length) {
+      // Merge saved progress onto current seed, preserve user-added cards.
+      const savedById = {}; for (const c of d.cards) savedById[c.id] = c;
+      nextCards = nextCards.map(c => {
+        const s = savedById[c.id];
+        return s ? { ...c, easeFactor: s.easeFactor ?? c.easeFactor, interval: s.interval ?? c.interval, repetitions: s.repetitions ?? c.repetitions, nextReview: s.nextReview ?? c.nextReview, lastReview: s.lastReview ?? c.lastReview } : c;
+      });
+      // User-added cards (not in seed).
+      const seedIds = new Set(SEED_CARDS.map(c => c.id));
+      for (const c of d.cards) if (!seedIds.has(c.id)) nextCards.push({ ...c, related: c.related || [] });
+    }
+    setCards(nextCards);
     if (d?.history?.length) setHistory(d.history);
     setLoaded(true); setView("dashboard");
   }, []);
@@ -64,34 +115,90 @@ export default function InterAlia() {
   // Save
   useEffect(() => { if (loaded) save("interalia-all", { cards, history }); }, [cards, history, loaded]);
 
+  // ─── Review flow ──────────────────────────────────────────────────
+  const prepareQueue = useCallback((pool, modeHint) => {
+    if (!pool.length) return;
+    const due = getDue(pool).filter(c => c.lastReview > 0);
+    let queue, mode, label;
+    if (modeHint === "new") {
+      queue = pool.filter(c => c.lastReview === 0).slice(0, 20);
+      mode = "new"; label = `New: ${queue.length} cards`;
+    } else if (due.length) {
+      queue = due;
+      mode = "due"; label = `Review: ${queue.length} due`;
+    } else {
+      // Ask user to opt in to new cards.
+      const newCards = pool.filter(c => c.lastReview === 0);
+      if (!newCards.length) return;
+      if (!confirm(`Nothing due. Would you like to study ${Math.min(20, newCards.length)} new cards?`)) return;
+      queue = newCards.slice(0, 20);
+      mode = "new"; label = `New: ${queue.length} cards`;
+    }
+    if (!queue.length) return;
+    setReviewQueue(queue);
+    setQueueMeta({ label, mode });
+    setCurrentIdx(0);
+    setSelectedOpt(null);
+    setExpandedRelated({});
+    setMcqOptions(buildMcqOptions(queue[0], cards));
+    setSessionStats({ reviewed: 0, correct: 0, results: [] });
+    setView("review");
+    setSelectedModule(null);
+  }, [cards]);
+
   const startReview = useCallback((mode, value, typeFilter) => {
     let pool;
     if (mode === "cross") pool = shuffle(cards.filter(c => c.crossCutting));
     else if (mode === "module") pool = value === "all" ? cards : cards.filter(c => c.module === value);
     else pool = cards;
     if (typeFilter) pool = pool.filter(c => typeFilter[c.type]);
-    let due = getDue(pool);
-    if (!due.length) due = pool.filter(c => c.repetitions === 0).slice(0, 10);
-    if (mode === "cross") due = shuffle(due); // always random for cross-cutting
-    if (!due.length) return;
-    setReviewQueue(due); setCurrentIdx(0); setFlipped(false); setShowDetails(false);
-    setSessionStats({ reviewed: 0, avgQ: 0, qs: [] }); setView("review");
-    setSelectedModule(null);
-  }, [cards]);
+    prepareQueue(pool);
+  }, [cards, prepareQueue]);
 
-  const rateCard = useCallback((q) => {
+  const answerCard = useCallback((optIdx) => {
+    if (selectedOpt !== null) return;
+    setSelectedOpt(optIdx);
     const card = reviewQueue[currentIdx];
-    setCards(prev => prev.map(c => c.id === card.id ? sm2(c, q) : c));
-    setHistory(prev => [...prev, { cardId: card.id, q, ts: Date.now() }]);
-    const nq = [...sessionStats.qs, q];
-    setSessionStats({ reviewed: sessionStats.reviewed + 1, avgQ: nq.reduce((a, b) => a + b, 0) / nq.length, qs: nq });
-    if (currentIdx < reviewQueue.length - 1) { setCurrentIdx(currentIdx + 1); setFlipped(false); setShowDetails(false); }
-    else setView("summary");
-  }, [reviewQueue, currentIdx, sessionStats]);
+    const correct = mcqOptions[optIdx]?.correct;
+    const quality = correct ? 4 : 1;
+    setCards(prev => prev.map(c => c.id === card.id ? sm2(c, quality) : c));
+    setHistory(prev => [...prev, { cardId: card.id, q: quality, correct, ts: Date.now() }]);
+    setSessionStats(s => ({ reviewed: s.reviewed + 1, correct: s.correct + (correct ? 1 : 0), results: [...s.results, correct] }));
+  }, [selectedOpt, reviewQueue, currentIdx, mcqOptions]);
 
+  const nextCard = useCallback(() => {
+    if (currentIdx < reviewQueue.length - 1) {
+      const nextIdx = currentIdx + 1;
+      setCurrentIdx(nextIdx);
+      setSelectedOpt(null);
+      setExpandedRelated({});
+      setMcqOptions(buildMcqOptions(reviewQueue[nextIdx], cards));
+    } else {
+      setView("summary");
+    }
+  }, [currentIdx, reviewQueue, cards]);
+
+  // ─── Keyboard shortcuts ───────────────────────────────────────────
+  useEffect(() => {
+    if (view !== "review") return;
+    const handler = (e) => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+      if (e.key === "Escape") { setView("dashboard"); return; }
+      if (selectedOpt === null) {
+        const n = parseInt(e.key, 10);
+        if (n >= 1 && n <= 4 && mcqOptions[n - 1]) { e.preventDefault(); answerCard(n - 1); }
+      } else {
+        if (e.key === " " || e.key === "Enter") { e.preventDefault(); nextCard(); }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [view, selectedOpt, mcqOptions, answerCard, nextCard]);
+
+  // ─── Add / reset ──────────────────────────────────────────────────
   const addCard = useCallback(() => {
     if (!addForm.front || !addForm.back || !addForm.module) return;
-    setCards(prev => [...prev, { id: String(Date.now()), type: addForm.type, module: addForm.module, tags: addForm.tags.split(",").map(t => t.trim()).filter(Boolean), crossCutting: addForm.crossCutting, front: addForm.front, back: addForm.back, details: addForm.details, easeFactor: 2.5, interval: 0, repetitions: 0, nextReview: 0, lastReview: 0 }]);
+    setCards(prev => [...prev, { id: "u-" + Date.now(), type: addForm.type, module: addForm.module, tags: addForm.tags.split(",").map(t => t.trim()).filter(Boolean), crossCutting: addForm.crossCutting, front: addForm.front, back: addForm.back, details: addForm.details, related: [], easeFactor: 2.5, interval: 0, repetitions: 0, nextReview: 0, lastReview: 0 }]);
     setAddForm({ type: "principle", module: MODULES[0], tags: "", front: "", back: "", details: "", crossCutting: false });
   }, [addForm]);
 
@@ -101,6 +208,51 @@ export default function InterAlia() {
     setHistory([]);
   }, []);
 
+  // ─── Export / import ──────────────────────────────────────────────
+  const exportData = useCallback(() => {
+    const userCards = cards.filter(isUserCard);
+    const seedProgress = cards.filter(c => isSeedId(c.id) && c.lastReview > 0).map(c => ({ id: c.id, easeFactor: c.easeFactor, interval: c.interval, repetitions: c.repetitions, nextReview: c.nextReview, lastReview: c.lastReview }));
+    const payload = { version: 1, exportedAt: Date.now(), userCards, seedProgress, history };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `interalia-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [cards, history]);
+
+  const importData = useCallback((file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data || typeof data !== "object") throw new Error("Invalid file");
+        const userCards = Array.isArray(data.userCards) ? data.userCards : [];
+        const seedProgress = Array.isArray(data.seedProgress) ? data.seedProgress : [];
+        const importedHistory = Array.isArray(data.history) ? data.history : [];
+        setCards(prev => {
+          const progressById = {}; for (const p of seedProgress) progressById[p.id] = p;
+          const merged = prev.map(c => {
+            if (isSeedId(c.id) && progressById[c.id]) return { ...c, ...progressById[c.id] };
+            return c;
+          });
+          // Remove existing user cards then add imported ones.
+          const onlySeed = merged.filter(c => isSeedId(c.id));
+          const importedUsers = userCards.map(c => ({ ...c, related: c.related || [] }));
+          return [...onlySeed, ...importedUsers];
+        });
+        setHistory(importedHistory);
+        setImportMsg(`Imported ${userCards.length} user cards, ${seedProgress.length} progress records, ${importedHistory.length} history entries.`);
+        setTimeout(() => setImportMsg(""), 4000);
+      } catch (err) {
+        setImportMsg("Import failed: " + err.message);
+        setTimeout(() => setImportMsg(""), 4000);
+      }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  // ─── Derived: filtered library, history viz ──────────────────────
   const filtered = useMemo(() => cards.filter(c => {
     if (moduleFilter !== "all" && c.module !== moduleFilter) return false;
     if (typeFilter !== "all" && c.type !== typeFilter) return false;
@@ -109,6 +261,29 @@ export default function InterAlia() {
     if (searchTerm) { const s = searchTerm.toLowerCase(); return c.front.toLowerCase().includes(s) || c.back.toLowerCase().includes(s) || c.tags?.some(t => t.toLowerCase().includes(s)); }
     return true;
   }), [cards, moduleFilter, typeFilter, ccFilter, searchTerm]);
+
+  const historyViz = useMemo(() => {
+    const days = 14;
+    const startOfDay = (ts) => { const d = new Date(ts); d.setHours(0, 0, 0, 0); return d.getTime(); };
+    const today0 = startOfDay(Date.now());
+    const perDay = new Array(days).fill(0);
+    const daySet = new Set();
+    for (const h of history) {
+      const dayStart = startOfDay(h.ts);
+      daySet.add(dayStart);
+      const diff = Math.round((today0 - dayStart) / 86400000);
+      if (diff >= 0 && diff < days) perDay[days - 1 - diff] += 1;
+    }
+    // Streak
+    let streak = 0;
+    for (let i = 0; ; i++) {
+      const d = today0 - i * 86400000;
+      if (daySet.has(d)) streak += 1;
+      else if (i === 0) continue; // today may have no reviews; still count yesterday streak
+      else break;
+    }
+    return { perDay, total: history.length, streak, max: Math.max(1, ...perDay) };
+  }, [history]);
 
   // ─── Styles ─────────────────────────────────────────────────────
   const S = {
@@ -122,12 +297,21 @@ export default function InterAlia() {
     tag: { display: "inline-block", fontSize: 10, padding: "2px 7px", borderRadius: 14, background: "rgba(255,255,255,0.03)", color: "#5a5650", marginLeft: 4 },
     ccTag: { display: "inline-block", fontSize: 10, padding: "2px 7px", borderRadius: 14, background: "rgba(196,155,189,0.07)", color: "#b088a8", marginLeft: 4 },
     btn: (v = "p") => ({ padding: "8px 15px", borderRadius: 6, cursor: "pointer", fontSize: 13, fontFamily: "'Newsreader', Georgia, serif", fontWeight: 500, border: "none", ...(v === "p" ? { background: "rgba(212,165,116,0.1)", color: "#D4A574", border: "1px solid rgba(212,165,116,0.2)" } : v === "d" ? { background: "rgba(200,70,70,0.08)", color: "#b85050", border: "1px solid rgba(200,70,70,0.12)" } : { background: "transparent", color: "#5a5650", border: "1px solid rgba(255,255,255,0.05)" }) }),
-    qb: (q) => { const c = ["#c84848", "#b86838", "#a88838", "#78a060", "#589878", "#4888a8"]; return { flex: 1, padding: "10px 2px", borderRadius: 6, cursor: "pointer", background: `${c[q]}0c`, border: `1px solid ${c[q]}20`, color: c[q], textAlign: "center", minWidth: 0 }; },
+    mcq: (state) => {
+      // state: idle | selected-right | selected-wrong | reveal-right | reveal-wrong-faded
+      const base = { display: "block", width: "100%", textAlign: "left", padding: "12px 14px", borderRadius: 7, cursor: state === "idle" ? "pointer" : "default", fontSize: 13.5, fontFamily: "'Newsreader', Georgia, serif", lineHeight: 1.55, marginBottom: 8, transition: "all 0.2s ease", boxSizing: "border-box" };
+      if (state === "idle") return { ...base, background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", color: "#d4d0c8" };
+      if (state === "selected-right") return { ...base, background: "rgba(120,160,96,0.15)", border: "1px solid rgba(120,160,96,0.5)", color: "#a6c68a" };
+      if (state === "selected-wrong") return { ...base, background: "rgba(200,72,72,0.15)", border: "1px solid rgba(200,72,72,0.5)", color: "#d48080" };
+      if (state === "reveal-right") return { ...base, background: "rgba(120,160,96,0.1)", border: "1px solid rgba(120,160,96,0.4)", color: "#8bb874" };
+      return { ...base, background: "rgba(255,255,255,0.012)", border: "1px solid rgba(255,255,255,0.03)", color: "#4a4640", opacity: 0.55 };
+    },
     inp: { width: "100%", padding: "8px 10px", borderRadius: 6, background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.05)", color: "#e8e4dc", fontSize: 13, fontFamily: "'Newsreader', Georgia, serif", outline: "none", boxSizing: "border-box" },
     ta: { width: "100%", padding: "8px 10px", borderRadius: 6, minHeight: 64, resize: "vertical", background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.05)", color: "#e8e4dc", fontSize: 13, fontFamily: "'Newsreader', Georgia, serif", outline: "none", boxSizing: "border-box", lineHeight: 1.6 },
     sel: { padding: "6px 8px", borderRadius: 6, background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.05)", color: "#e8e4dc", fontSize: 11.5, fontFamily: "'Newsreader', Georgia, serif", outline: "none", cursor: "pointer" },
     sec: { fontSize: 11.5, color: "#5a5650", marginBottom: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: "system-ui, sans-serif" },
     sb: { textAlign: "center", padding: 11, background: "rgba(255,255,255,0.015)", borderRadius: 7, border: "1px solid rgba(255,255,255,0.025)" },
+    footer: { marginTop: 32, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.04)", textAlign: "center", fontSize: 10.5, color: "#3a3830", fontFamily: "system-ui, sans-serif", letterSpacing: "0.04em" },
   };
 
   if (view === "loading") return (
@@ -139,29 +323,49 @@ export default function InterAlia() {
   // ─── Dashboard ──────────────────────────────────────────────────
   const Dash = () => {
     const today = history.filter(h => h.ts > Date.now() - 86400000).length;
+    const dueCount = strictDue.length;
     return (<div>
       <div style={{ marginBottom: 22 }}>
         <h2 style={{ fontSize: 17, color: "#e8e4dc", marginBottom: 2, fontWeight: 500 }}>Review Queue</h2>
-        <p style={{ color: "#5a5650", fontSize: 12.5, margin: 0 }}>{stats.due > 0 ? `${stats.due} due` : "Nothing due"}{today > 0 ? ` · ${today} today` : ""}</p>
+        <p style={{ color: "#5a5650", fontSize: 12.5, margin: 0 }}>{dueCount > 0 ? `${dueCount} due` : "Nothing due"}{today > 0 ? ` · ${today} today` : ""}</p>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 7, marginBottom: 22 }}>
-        {[[stats.due, "Due", "#D4A574"], [stats.new, "New", "#b088a8"], [stats.learning, "Learning", "#7BA5C4"], [stats.mature, "Mature", "#8BB874"]].map(([n, l, c]) => (
+        {[[dueCount, "Due", "#D4A574"], [stats.new, "New", "#b088a8"], [stats.learning, "Learning", "#7BA5C4"], [stats.mature, "Mature", "#8BB874"]].map(([n, l, c]) => (
           <div key={l} style={S.sb}><div style={{ fontSize: 24, fontWeight: 700, color: c }}>{n}</div><div style={{ fontSize: 10, color: "#5a5650", marginTop: 1, textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "system-ui" }}>{l}</div></div>
         ))}
       </div>
 
-      <div style={{ display: "flex", gap: 6, marginBottom: 26, flexWrap: "wrap" }}>
-        <button style={S.btn("p")} onClick={() => startReview("module", "all")}>Review All ({stats.due || "new"})</button>
+      <div style={{ display: "flex", gap: 6, marginBottom: 22, flexWrap: "wrap" }}>
+        <button style={S.btn("p")} onClick={() => startReview("module", "all")}>
+          {dueCount > 0 ? `Review Due (${dueCount})` : `Study New`}
+        </button>
         <button style={{ ...S.btn("p"), background: "rgba(176,136,168,0.08)", color: "#b088a8", border: "1px solid rgba(176,136,168,0.18)" }} onClick={() => startReview("cross")}>
           Cross-cutting ({stats.crossCutting})
         </button>
         <button style={S.btn("g")} onClick={resetProgress}>Reset</button>
       </div>
 
+      {/* History viz */}
+      {historyViz.total > 0 && (
+        <div style={{ ...S.card, padding: "14px 16px", marginBottom: 22 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+            <div style={S.sec}>Activity · last 14 days</div>
+            <div style={{ fontSize: 11, color: "#5a5650", fontFamily: "system-ui" }}>
+              <span style={{ color: "#D4A574" }}>{historyViz.total}</span> all-time · <span style={{ color: "#8BB874" }}>{historyViz.streak}</span>d streak
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 42 }}>
+            {historyViz.perDay.map((n, i) => (
+              <div key={i} title={`${n} reviews`} style={{ flex: 1, height: `${Math.max(3, (n / historyViz.max) * 100)}%`, background: n > 0 ? "rgba(212,165,116,0.5)" : "rgba(255,255,255,0.04)", borderRadius: 2, minHeight: 3 }} />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div style={S.sec}>By Module</div>
       <div style={{ display: "grid", gap: 5, marginBottom: 6 }}>
-        {MODULES.map(m => { const mc = cards.filter(c => c.module === m); const md = getDue(mc).length; const isOpen = selectedModule === m; if (!mc.length) return (
+        {MODULES.map(m => { const mc = cards.filter(c => c.module === m); const md = mc.filter(c => c.lastReview > 0 && c.nextReview <= Date.now()).length; const isOpen = selectedModule === m; if (!mc.length) return (
           <div key={m} style={{ ...S.card, padding: "11px 14px", marginBottom: 0, opacity: 0.4 }}>
             <div style={{ fontSize: 13.5, color: "#8a8680" }}>{m}</div>
             <div style={{ fontSize: 10.5, color: "#5a5650" }}>No cards yet</div>
@@ -191,6 +395,15 @@ export default function InterAlia() {
           </div>
         ); })}
       </div>
+
+      {/* Export / Import */}
+      <div style={{ marginTop: 20, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ ...S.sec, marginBottom: 0, marginRight: 6 }}>Data</div>
+        <button style={{ ...S.btn("g"), fontSize: 11, padding: "5px 10px" }} onClick={exportData}>Export JSON</button>
+        <button style={{ ...S.btn("g"), fontSize: 11, padding: "5px 10px" }} onClick={() => fileInputRef.current?.click()}>Import JSON</button>
+        <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; if (f) importData(f); e.target.value = ""; }} />
+        {importMsg && <span style={{ fontSize: 11, color: "#8BB874", fontFamily: "system-ui" }}>{importMsg}</span>}
+      </div>
     </div>);
   };
 
@@ -198,9 +411,24 @@ export default function InterAlia() {
   const Rev = () => {
     const card = reviewQueue[currentIdx];
     if (!card) return <div style={{ color: "#5a5650", padding: 28, textAlign: "center" }}>No cards.</div>;
+    const answered = selectedOpt !== null;
+    const chosenCorrect = answered && mcqOptions[selectedOpt]?.correct;
+    const cardIsDue = card.lastReview > 0 && card.nextReview <= Date.now();
+
+    const optState = (i) => {
+      if (!answered) return "idle";
+      const opt = mcqOptions[i];
+      if (i === selectedOpt) return opt.correct ? "selected-right" : "selected-wrong";
+      if (opt.correct) return "reveal-right";
+      return "reveal-wrong-faded";
+    };
+
     return (<div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <span style={{ fontSize: 12, color: "#5a5650" }}>{currentIdx + 1} / {reviewQueue.length}</span>
+        <span style={{ fontSize: 12, color: "#5a5650" }}>
+          {currentIdx + 1} / {reviewQueue.length}
+          <span style={{ marginLeft: 8, fontSize: 9.5, padding: "1px 7px", borderRadius: 10, background: cardIsDue ? "rgba(212,165,116,0.1)" : "rgba(176,136,168,0.08)", color: cardIsDue ? "#D4A574" : "#b088a8", textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "system-ui" }}>{cardIsDue ? "Due" : "New"}</span>
+        </span>
         <button style={S.btn("g")} onClick={() => setView("dashboard")}>✕ End</button>
       </div>
       <div style={{ height: 2, background: "rgba(255,255,255,0.03)", borderRadius: 1, marginBottom: 20 }}>
@@ -213,36 +441,75 @@ export default function InterAlia() {
           {card.crossCutting && <span style={S.ccTag}>⬡ Cross-cutting</span>}
         </div>
         <div style={{ fontSize: 15.5, lineHeight: 1.65, marginTop: 14, marginBottom: 18, color: "#e8e4dc" }}>{card.front}</div>
-        {!flipped ? (
-          <button style={{ ...S.btn("p"), width: "100%" }} onClick={() => setFlipped(true)}>Show Answer</button>
-        ) : (<div>
-          <div style={{ fontSize: 14, lineHeight: 1.7, color: "#c4c0b8", padding: 15, background: "rgba(212,165,116,0.025)", borderLeft: "3px solid rgba(212,165,116,0.18)", borderRadius: "0 6px 6px 0" }}>{card.back}</div>
-          {card.details && (<div>
-            <button style={{ ...S.btn("g"), marginTop: 8, fontSize: 11, padding: "3px 8px" }} onClick={() => setShowDetails(!showDetails)}>{showDetails ? "Hide" : "Show"} notes</button>
-            {showDetails && <div style={{ fontSize: 12.5, lineHeight: 1.7, color: "#686460", marginTop: 8, padding: 11, background: "rgba(255,255,255,0.012)", borderRadius: 6, fontStyle: "italic" }}>{card.details}</div>}
-          </div>)}
-          <div style={{ marginTop: 18 }}>
-            <div style={{ fontSize: 10.5, color: "#5a5650", marginBottom: 6, textAlign: "center" }}>How well did you recall this?</div>
-            <div style={{ display: "flex", gap: 4 }}>
-              {Q_LABELS.map(({ q, l }) => (<button key={q} style={S.qb(q)} onClick={() => rateCard(q)}><div style={{ fontSize: 15, fontWeight: 700, fontFamily: "system-ui" }}>{q}</div><div style={{ fontSize: 9, marginTop: 1, fontFamily: "system-ui" }}>{l}</div></button>))}
+
+        {/* MCQ options */}
+        <div>
+          {mcqOptions.map((opt, i) => (
+            <button key={i} disabled={answered} onClick={() => answerCard(i)} style={S.mcq(optState(i))}>
+              <span style={{ display: "inline-block", width: 20, color: "#5a5650", fontFamily: "system-ui", fontSize: 11 }}>{i + 1}.</span>
+              {opt.text}
+            </button>
+          ))}
+        </div>
+
+        {/* Feedback + details + related */}
+        {answered && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: chosenCorrect ? "#8BB874" : "#c47070", marginBottom: 10, fontFamily: "system-ui", letterSpacing: "0.03em", textTransform: "uppercase" }}>
+              {chosenCorrect ? "✓ Correct" : "✗ Incorrect"}
             </div>
+            <div style={{ fontSize: 14, lineHeight: 1.7, color: "#c4c0b8", padding: 15, background: "rgba(212,165,116,0.025)", borderLeft: "3px solid rgba(212,165,116,0.25)", borderRadius: "0 6px 6px 0", marginBottom: 12 }}>{card.back}</div>
+            {card.details && (
+              <div style={{ fontSize: 12.5, lineHeight: 1.75, color: "#8a8680", padding: 13, background: "rgba(255,255,255,0.015)", borderRadius: 6, marginBottom: 12 }}>{card.details}</div>
+            )}
+            {card.related?.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 10, color: "#5a5650", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: "system-ui" }}>Related</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                  {card.related.map(rid => { const r = cardById[rid]; if (!r) return null; const exp = expandedRelated[rid]; return (
+                    <div key={rid} style={{ flex: "1 1 100%" }}>
+                      <button onClick={() => setExpandedRelated(e => ({ ...e, [rid]: !e[rid] }))} style={{ ...S.btn("g"), fontSize: 11, padding: "5px 10px", textAlign: "left", width: "100%", borderColor: "rgba(176,136,168,0.18)", color: "#b088a8", background: "rgba(176,136,168,0.05)" }}>
+                        {exp ? "▾" : "▸"} {truncate(r.front, 90)}
+                      </button>
+                      {exp && (
+                        <div style={{ marginTop: 4, marginBottom: 4, padding: 11, background: "rgba(176,136,168,0.04)", border: "1px solid rgba(176,136,168,0.1)", borderRadius: 6 }}>
+                          <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
+                            <span style={S.bdg(TYPE_COLORS[r.type])}>{CARD_TYPES[r.type]}</span>
+                            <span style={S.tag}>{r.module}</span>
+                          </div>
+                          <div style={{ fontSize: 12.5, color: "#c4c0b8", lineHeight: 1.6, marginBottom: 6 }}>{r.back}</div>
+                          {r.details && <div style={{ fontSize: 11.5, color: "#6a6660", lineHeight: 1.6, fontStyle: "italic" }}>{r.details}</div>}
+                        </div>
+                      )}
+                    </div>
+                  ); })}
+                </div>
+              </div>
+            )}
+            <button style={{ ...S.btn("p"), width: "100%", marginTop: 4 }} onClick={nextCard}>
+              {currentIdx < reviewQueue.length - 1 ? "Next →" : "Finish"}
+            </button>
           </div>
-        </div>)}
+        )}
       </div>
-      <div style={{ fontSize: 10, color: "#383430", textAlign: "center" }}>{card.repetitions > 0 ? `${card.repetitions}× · ${card.interval}d · ease ${card.easeFactor.toFixed(2)}` : "First review"}</div>
+      <div style={{ fontSize: 10, color: "#383430", textAlign: "center", marginBottom: 8 }}>{card.repetitions > 0 ? `${card.repetitions}× · ${card.interval}d · ease ${card.easeFactor.toFixed(2)}` : "First review"}</div>
+      <div style={{ fontSize: 9.5, color: "#383430", textAlign: "center", fontFamily: "system-ui", letterSpacing: "0.03em" }}>1–4 to answer · Space to continue · Esc to exit</div>
     </div>);
   };
 
   // ─── Summary ────────────────────────────────────────────────────
-  const Sum = () => (<div style={{ textAlign: "center", paddingTop: 28 }}>
-    <div style={{ fontSize: 38, marginBottom: 10 }}>✓</div>
-    <h2 style={{ fontSize: 18, color: "#e8e4dc", fontWeight: 500, marginBottom: 4 }}>Session Complete</h2>
-    <p style={{ color: "#5a5650", fontSize: 13, marginBottom: 22 }}>{sessionStats.reviewed} cards · Avg {sessionStats.avgQ.toFixed(1)}/5</p>
-    <div style={{ display: "flex", gap: 4, justifyContent: "center", flexWrap: "wrap", marginBottom: 22 }}>
-      {sessionStats.qs.map((q, i) => (<div key={i} style={{ width: 22, height: 22, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10.5, fontWeight: 600, background: q >= 4 ? "rgba(120,160,96,0.1)" : q >= 3 ? "rgba(168,136,56,0.1)" : "rgba(200,72,72,0.1)", color: q >= 4 ? "#78a060" : q >= 3 ? "#a88838" : "#c84848", fontFamily: "system-ui" }}>{q}</div>))}
-    </div>
-    <button style={S.btn("p")} onClick={() => setView("dashboard")}>Dashboard</button>
-  </div>);
+  const Sum = () => {
+    const pct = sessionStats.reviewed > 0 ? Math.round((sessionStats.correct / sessionStats.reviewed) * 100) : 0;
+    return (<div style={{ textAlign: "center", paddingTop: 28 }}>
+      <div style={{ fontSize: 38, marginBottom: 10 }}>✓</div>
+      <h2 style={{ fontSize: 18, color: "#e8e4dc", fontWeight: 500, marginBottom: 4 }}>Session Complete</h2>
+      <p style={{ color: "#5a5650", fontSize: 13, marginBottom: 22 }}>{sessionStats.reviewed} cards · {sessionStats.correct} correct ({pct}%)</p>
+      <div style={{ display: "flex", gap: 4, justifyContent: "center", flexWrap: "wrap", marginBottom: 22 }}>
+        {sessionStats.results.map((c, i) => (<div key={i} style={{ width: 22, height: 22, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600, background: c ? "rgba(120,160,96,0.12)" : "rgba(200,72,72,0.12)", color: c ? "#8BB874" : "#c47070", fontFamily: "system-ui" }}>{c ? "✓" : "✗"}</div>))}
+      </div>
+      <button style={S.btn("p")} onClick={() => setView("dashboard")}>Dashboard</button>
+    </div>);
+  };
 
   // ─── Browse ─────────────────────────────────────────────────────
   const Lib = () => (<div>
@@ -314,5 +581,6 @@ export default function InterAlia() {
     {view === "summary" && <Sum />}
     {view === "browse" && <Lib />}
     {view === "add" && <Add />}
+    <div style={S.footer}>© Gene Leung</div>
   </div>);
 }
