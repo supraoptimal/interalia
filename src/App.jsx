@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { SEED_CARDS } from "./cards.js";
+import { SEED_CARDS } from "./cards/index.js";
 
 // ─── SM-2 Algorithm ─────────────────────────────────────────────────
 function sm2(card, quality) {
@@ -22,12 +22,10 @@ function load(key, fb) { try { const r = localStorage.getItem(key); return r ? J
 const MODULES = ["Public Law", "Criminal Law", "Contract Law", "Tort", "Commercial Law", "Property Law", "Jurisprudence", "Equity & Trusts", "Evidence"];
 const CARD_TYPES = { principle: "Principle", case: "Case", application: "Application", distinction: "Distinction" };
 const TYPE_COLORS = { principle: "#D4A574", case: "#7BA5C4", application: "#8BB874", distinction: "#C49BBD" };
-const MAX_OPT_LEN = 180;
-
 // ─── Helpers ────────────────────────────────────────────────────────
 function getDue(cards) { return cards.filter(c => c.nextReview <= Date.now()).sort((a, b) => a.nextReview - b.nextReview); }
 function shuffle(arr) { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
-function truncate(s, n = MAX_OPT_LEN) { if (!s) return ""; return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s; }
+function truncate(s, n) { if (!s) return ""; return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s; }
 function isSeedId(id) { return SEED_CARDS.some(c => c.id === id); }
 function isUserCard(card) { return !isSeedId(card.id); }
 
@@ -52,8 +50,8 @@ function buildMcqOptions(card, allCards) {
       distractors.push(c);
     }
   }
-  const correct = { text: truncate(card.back), correct: true };
-  const opts = distractors.map(c => ({ text: truncate(c.back), correct: false }));
+  const correct = { text: card.back, correct: true };
+  const opts = distractors.map(c => ({ text: c.back, correct: false }));
   return shuffle([correct, ...opts]);
 }
 
@@ -299,7 +297,7 @@ export default function InterAlia() {
     btn: (v = "p") => ({ padding: "8px 15px", borderRadius: 6, cursor: "pointer", fontSize: 13, fontFamily: "'Newsreader', Georgia, serif", fontWeight: 500, border: "none", ...(v === "p" ? { background: "rgba(212,165,116,0.1)", color: "#D4A574", border: "1px solid rgba(212,165,116,0.2)" } : v === "d" ? { background: "rgba(200,70,70,0.08)", color: "#b85050", border: "1px solid rgba(200,70,70,0.12)" } : { background: "transparent", color: "#5a5650", border: "1px solid rgba(255,255,255,0.05)" }) }),
     mcq: (state) => {
       // state: idle | selected-right | selected-wrong | reveal-right | reveal-wrong-faded
-      const base = { display: "block", width: "100%", textAlign: "left", padding: "12px 14px", borderRadius: 7, cursor: state === "idle" ? "pointer" : "default", fontSize: 13.5, fontFamily: "'Newsreader', Georgia, serif", lineHeight: 1.55, marginBottom: 8, transition: "all 0.2s ease", boxSizing: "border-box" };
+      const base = { display: "flex", alignItems: "flex-start", gap: 8, width: "100%", minHeight: "auto", height: "auto", textAlign: "left", padding: "12px 14px", borderRadius: 7, cursor: state === "idle" ? "pointer" : "default", fontSize: 13.5, fontFamily: "'Newsreader', Georgia, serif", lineHeight: 1.55, marginBottom: 8, transition: "all 0.2s ease", boxSizing: "border-box", whiteSpace: "normal", wordBreak: "break-word", overflowWrap: "break-word" };
       if (state === "idle") return { ...base, background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", color: "#d4d0c8" };
       if (state === "selected-right") return { ...base, background: "rgba(120,160,96,0.15)", border: "1px solid rgba(120,160,96,0.5)", color: "#a6c68a" };
       if (state === "selected-wrong") return { ...base, background: "rgba(200,72,72,0.15)", border: "1px solid rgba(200,72,72,0.5)", color: "#d48080" };
@@ -446,8 +444,8 @@ export default function InterAlia() {
         <div>
           {mcqOptions.map((opt, i) => (
             <button key={i} disabled={answered} onClick={() => answerCard(i)} style={S.mcq(optState(i))}>
-              <span style={{ display: "inline-block", width: 20, color: "#5a5650", fontFamily: "system-ui", fontSize: 11 }}>{i + 1}.</span>
-              {opt.text}
+              <span style={{ flexShrink: 0, width: 18, color: "#5a5650", fontFamily: "system-ui", fontSize: 11, paddingTop: 2 }}>{i + 1}.</span>
+              <span style={{ flex: 1, minWidth: 0 }}>{opt.text}</span>
             </button>
           ))}
         </div>
@@ -469,7 +467,7 @@ export default function InterAlia() {
                   {card.related.map(rid => { const r = cardById[rid]; if (!r) return null; const exp = expandedRelated[rid]; return (
                     <div key={rid} style={{ flex: "1 1 100%" }}>
                       <button onClick={() => setExpandedRelated(e => ({ ...e, [rid]: !e[rid] }))} style={{ ...S.btn("g"), fontSize: 11, padding: "5px 10px", textAlign: "left", width: "100%", borderColor: "rgba(176,136,168,0.18)", color: "#b088a8", background: "rgba(176,136,168,0.05)" }}>
-                        {exp ? "▾" : "▸"} {truncate(r.front, 90)}
+                        {exp ? "▾" : "▸"} {truncate(r.front, 120)}
                       </button>
                       {exp && (
                         <div style={{ marginTop: 4, marginBottom: 4, padding: 11, background: "rgba(176,136,168,0.04)", border: "1px solid rgba(176,136,168,0.1)", borderRadius: 6 }}>
